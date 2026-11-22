@@ -3,6 +3,7 @@ local bit = require("bit")
 local android = require("androidapi")
 
 local constants = android.Constants
+local jni = android.jni
 local lib = android.libandroid
 local app = android.app()
 
@@ -283,11 +284,17 @@ function AndroidWindow:setBackHandled(handled)
 	backHandled = handled
 end
 
---- The display's fastest refresh rate, in hertz. Android runs it at that rate while the user is
---- touching the window and for a moment after (see the loop), and chooses for itself otherwise.
+local currentRate, invalidateRate -- Forward declarations: defined with the clock, below.
+
+--- The rate the display is running at now, in hertz. That is not the fastest rate the display
+--- has a mode for: the loop asks for that one while the user is touching the window and for a
+--- moment after, but a phone may keep its panel at 60 Hz regardless, and pacing has to follow
+--- what the panel does rather than what was asked of it. The read is kept for a moment, and
+--- taken again once a request has had time to settle or the display has changed, so a window
+--- that asks every frame costs no JNI call a frame.
 ---@return number?
 function AndroidWindow:refreshRate()
-	return android.maxRefreshRate()
+	return currentRate()
 end
 
 function AndroidWindow:destroy()
@@ -422,8 +429,10 @@ local function handleCommand(self, event, window, callback)
 	if command == appCommand.initWindow then
 		window.nativeWindow = app.window
 		window.visible = true
-		-- A rate asked for belongs to the surface it was asked on, and this one is new.
+		-- A rate asked for belongs to the surface it was asked on, and this one is new: the rate
+		-- the last one ran at says nothing about this one.
 		self.fast = nil
+		invalidateRate()
 		refreshSize(self, window)
 		window.shouldRedraw = true
 
@@ -447,6 +456,11 @@ local function handleCommand(self, event, window, callback)
 	elseif command == appCommand.windowResized or command == appCommand.configChanged
 		or command == appCommand.contentRectChanged then
 		local width, height = window.width, window.height
+		if command == appCommand.configChanged then
+			-- A rotation, another display chosen, or the system's own rate changed: the rate the
+			-- display was running at is not the one to keep pacing against.
+			invalidateRate()
+		end
 		refreshSize(self, window)
 		window.shouldRedraw = true
 		if window.width ~= width or window.height ~= height then
@@ -514,6 +528,67 @@ local function densityScale()
 	return dpi > 0 and dpi / 160 or 1
 end
 
+-- How long a rate read is trusted for, and how long a display is given to take a rate it has just
+-- been asked for before it is read back. Together they keep the read to a handful a second even
+-- for a window that asks for its rate every frame, and let a panel that does switch be followed
+-- a fraction of a second after the request rather than a cache lifetime later.
+local RATE_TRUST = 0.5
+local RATE_SETTLE = 0.25
+-- The last rate read and when it was read, and when a rate request has settled enough to read
+-- again: until then the last read stands.
+---@type number?
+local rateHz
+---@type number?
+local rateAt
+---@type number?
+local rateDue
+
+--- The display's rate as the system reports it, in hertz, or nil where the call failed.
+---@return number?
+local function readRate()
+	local activity = app.activity.clazz
+	local hz = jni.frame(function()
+		local manager = jni.call(activity, "android/app/Activity", "getWindowManager",
+			"()Landroid/view/WindowManager;", "object")
+		local display = jni.call(manager, "android/view/WindowManager", "getDefaultDisplay",
+			"()Landroid/view/Display;", "object")
+		return jni.call(display, "android/view/Display", "getRefreshRate", "()F", "float")
+	end, 8)
+	return tonumber(hz)
+end
+
+--- Forget the rate that was read, so the next look sees the display as it is after a change.
+---@param settle number? # Seconds to leave the last read standing while the display takes a rate
+function invalidateRate(settle)
+	rateAt = nil
+	rateDue = settle ~= nil and (now() + settle) or nil
+end
+
+--- The rate the display is running at now: read back through JNI rather than assumed from what was
+--- asked for, and kept between reads. The fastest rate the display has a mode for is the fallback
+--- where the system cannot say.
+---@return number?
+function currentRate()
+	local at = now()
+	if rateDue ~= nil then
+		-- A request is still settling: the rate read before it stands, where there is one. Where
+		-- there is none, a start-up look is not a stale one and waiting it out would leave the
+		-- first frames paced as if the panel ran at its fastest mode.
+		if at < rateDue and rateHz ~= nil then return rateHz end
+		rateDue = nil
+	end
+	if rateHz ~= nil and rateAt ~= nil and at - rateAt < RATE_TRUST then
+		return rateHz
+	end
+	local hz = readRate()
+	if hz ~= nil and hz > 0 then
+		rateHz = hz
+	end
+	-- A failed read is not retried on every frame either: what is known stands for a while.
+	rateAt = at
+	return rateHz or android.maxRefreshRate()
+end
+
 ---@param self winit-android.EventLoop
 ---@param window winit-android.Window
 ---@param x number
@@ -524,6 +599,15 @@ local function scrollBy(self, window, x, y, dy, callback)
 	if dy ~= 0 then
 		deliver(self, { name = "mouseScroll", window = window, x = x, y = y, dx = 0, dy = dy, pixels = true }, callback)
 	end
+end
+
+--- A touch has no hover: with the last finger off the glass, nothing is under the pointer, and a
+--- program that kept the place the last one was at would keep a hover there until it moved again.
+---@param self winit-android.EventLoop
+---@param window winit-android.Window
+---@param callback winit.EventHandler
+local function leavePointer(self, window, callback)
+	deliver(self, { name = "mouseLeave", window = window }, callback)
 end
 
 ---@param self winit-android.EventLoop
@@ -602,6 +686,15 @@ local function handleTouch(self, event, window, callback)
 				end
 			end
 		end
+
+		-- The last finger is off the glass, so there is no pointer any more: what a program kept
+		-- of where it was is a hover over something nobody is pointing at. It goes after the
+		-- release the gesture came to, so a tap is still a click where the finger was; a finger
+		-- still down is still a pointer, and a fling is a scroll with a place of its own rather
+		-- than a pointer, so neither of those is a leave.
+		if #pointers == 1 then
+			leavePointer(self, window, callback)
+		end
 	elseif action == motionAction.cancel then
 		-- The system took the gesture (a swipe from the edge, a palm): every pointer is gone,
 		-- and none of them is a release a program should act on.
@@ -613,6 +706,9 @@ local function handleTouch(self, event, window, callback)
 			deliver(self, { name = "mouseRelease", window = window, x = p.x, y = p.y, button = 1 }, callback)
 		end
 		self.gesture = nil
+
+		-- Every finger went with the gesture, so nothing is under a pointer any more either.
+		leavePointer(self, window, callback)
 	end
 end
 
@@ -761,8 +857,10 @@ function AndroidEventLoop:run(callback)
 		if self.fling ~= nil and window ~= nil and window.nativeWindow ~= nil then
 			-- A step whose frame came out the same is not presented, and nothing waits for the
 			-- display then: the next step is held to a frame's time after the last one, so a list
-			-- coasting against its end does not spin the loop.
-			local frame = 1 / (android.maxRefreshRate() or 60)
+			-- coasting against its end does not spin the loop. A frame's time is the display's,
+			-- read back: asking for the fastest rate does not make a panel that stays at 60 run
+			-- one frame every 11 ms.
+			local frame = 1 / (currentRate() or 60)
 			local left = (self.fling.steppedAt or 0) + frame - now()
 			timeout = left > 0 and math.ceil(left * 1000) or 0
 		elseif self.fast and self.fastUntil ~= nil then
@@ -811,7 +909,7 @@ function AndroidEventLoop:run(callback)
 			-- A pass woken early -- by an event that came in between frames -- is not a frame of
 			-- the fling's own, and moves nothing.
 			local fling = self.fling
-			local frame = 1 / (android.maxRefreshRate() or 60)
+			local frame = 1 / (currentRate() or 60)
 			if fling ~= nil and now() - (fling.steppedAt or 0) >= frame * 0.75 then
 				stepFling(self, window, callback)
 				if self.fling ~= nil then self.fling.steppedAt = now() end
@@ -830,6 +928,10 @@ function AndroidEventLoop:run(callback)
 			if fast ~= self.fast then
 				self.fast = fast
 				android.setFrameRate(fast and (android.maxRefreshRate() or 0) or 0)
+				-- What the display does with the request is the system's to decide, so the rate
+				-- is read back rather than taken from what was asked: after the display has had
+				-- a moment to switch.
+				invalidateRate(RATE_SETTLE)
 			end
 		end
 

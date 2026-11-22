@@ -135,6 +135,7 @@ end
 --- | { window: winit.Window, name: "trayClick" }
 --- | { window: winit.Window, name: "trayMenu", id: string }
 --- | { window: winit.Window, name: "mouseMove", x: number, y: number }
+--- | { window: winit.Window, name: "mouseLeave" } # The pointer is no longer over the window, so nothing is under it until it moves again
 --- | { name: "mouseMotion", dx: number, dy: number }
 --- | { window: winit.Window, name: "mouseScroll", dx: number, dy: number, x: number?, y: number?, pixels: boolean? } # pixels: a touch drag, in pixels at x, y; otherwise a wheel's turn where the pointer is
 --- | { window: winit.Window, name: "mousePress", x: number, y: number, button: number }
