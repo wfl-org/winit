@@ -469,6 +469,9 @@ local FLING_FRICTION = 0.25
 local FLING_BRAKE_DP = 220 -- per second, per second
 -- How long the display is kept at its fastest rate after the last touch or fling.
 local FAST_HOLD = 2
+-- How long a finger rests without moving before it is a long press: the right button, which is a
+-- context menu, as on every phone.
+local LONG_PRESS = 0.5
 
 pcall(ffi.cdef, "int32_t AConfiguration_getDensity(void *config);")
 -- Under names of their own, so another module's declaration of the libc call cannot collide.
@@ -630,6 +633,22 @@ local function stepFling(self, window, callback)
 	end
 end
 
+--- A finger that has rested where it went down for long enough is a long press, told to the program
+--- as the right button pressed and let go there. What the finger does after it is nothing.
+---@param self winit-android.EventLoop
+---@param window winit-android.Window
+---@param callback winit.EventHandler
+local function checkLongPress(self, window, callback)
+	local gesture = self.gesture
+	if gesture == nil or gesture.mode ~= "pending" then return end
+	if now() - gesture.samples[1].t < LONG_PRESS then return end
+	gesture.mode = "held"
+	local x, y = gesture.startX, gesture.startY
+	deliver(self, { name = "mouseMove", window = window, x = x, y = y }, callback)
+	deliver(self, { name = "mousePress", window = window, x = x, y = y, button = 3 }, callback)
+	deliver(self, { name = "mouseRelease", window = window, x = x, y = y, button = 3 }, callback)
+end
+
 ---@param self winit-android.EventLoop
 ---@param event table
 ---@param window winit-android.Window
@@ -733,6 +752,11 @@ function AndroidEventLoop:run(callback)
 			local left = math.max(0, math.ceil((self.fastUntil - now()) * 1000))
 			if timeout < 0 or timeout > left then timeout = left end
 		end
+		-- A finger resting on the screen is woken for when it becomes a long press.
+		if self.gesture ~= nil and self.gesture.mode == "pending" then
+			local left = math.max(0, math.ceil((self.gesture.samples[1].t + LONG_PRESS - now()) * 1000))
+			if timeout < 0 or timeout > left then timeout = left end
+		end
 
 		android.pollOnce(timeout)
 		-- Drain whatever else is ready without waiting again, so a burst of input is handled in
@@ -762,6 +786,8 @@ function AndroidEventLoop:run(callback)
 
 		window = firstWindow(self)
 		if window ~= nil and window.nativeWindow ~= nil then
+			checkLongPress(self, window, callback)
+
 			-- Exactly one step of a fling for each frame, taken just before it is drawn and drawn
 			-- whatever the program's own frame pacing says: a step taken with no frame after it is
 			-- motion that shows up a frame late, two steps in one frame -- a list that jerks.
