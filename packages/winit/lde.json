@@ -1,10 +1,8 @@
 {
 	"name": "winit",
 	"description": "Cross platform windowing library for LuaJIT",
-	"authors": [
-		"David Cruz <david@bycruz.dev>"
-	],
-	"version": "0.1.15",
+	"authors": ["David Cruz <david@bycruz.dev>"],
+	"version": "0.1.16",
 	"dependencies": {
 		"winit-x11": {
 			"path": "../winit-x11",
@@ -24,18 +22,10 @@
 		}
 	},
 	"features": {
-		"linux": [
-			"winit-x11"
-		],
-		"windows": [
-			"winit-win32"
-		],
-		"macos": [
-			"winit-macos"
-		],
-		"android": [
-			"winit-android"
-		]
+		"linux": ["winit-x11"],
+		"windows": ["winit-win32"],
+		"macos": ["winit-macos"],
+		"android": ["winit-android"]
 	},
 	"devDependencies": {
 		"lde-test": {
