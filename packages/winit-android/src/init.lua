@@ -22,6 +22,15 @@ local axis = constants.Axis
 
 local KEYCODE_BACK = constants.KeyCode.back
 
+--- Keys the system also handles while the app has focus: the volume keys open the volume panel
+--- and change the stream. They are still reported to the program from the queue.
+---@type table<number, boolean>
+local volumeKeys = {
+	[24] = true, -- volume up
+	[25] = true, -- volume down
+	[164] = true, -- volume mute
+}
+
 ---@type table<number, winit.KeyName>
 local keyNames = {
 	[4] = "back",
@@ -184,8 +193,16 @@ local function onInput(_, input)
 		})
 		-- Back is reported and then left to the system, which finishes the activity -- a program
 		-- hears about that as windowClose -- unless the program said it handles back itself (see
-		-- `setBackHandled`). Every other key is the program's.
-		return (keyCode ~= KEYCODE_BACK or backHandled) and 1 or 0
+		-- `setBackHandled`). The volume keys are left to the system too, so the volume panel shows
+		-- and the stream changes, but the program still hears them from the queue. Every other key
+		-- is the program's.
+		if keyCode == KEYCODE_BACK then
+			return backHandled and 1 or 0
+		end
+		if volumeKeys[keyCode] then
+			return 0
+		end
+		return 1
 	end
 
 	return 0
