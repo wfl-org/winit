@@ -5,6 +5,7 @@ local wait = require("winit-x11.wait")
 local Clipboard = require("winit-x11.clipboard")
 local Dnd = require("winit-x11.dnd")
 local FileDialog = require("winit-x11.dialog")
+local refresh = require("winit-x11.refresh")
 
 ---@class winit-x11.Window
 ---@field id number
@@ -282,6 +283,15 @@ function X11Window:setIcon(width, height, rgba)
 	self.iconSet = true
 end
 
+--- The fastest refresh rate of the monitors the X server drives, in hertz, read once: the most
+--- frames a window could be shown at. Nothing where XRandR cannot say.
+---@return number?
+function X11Window:refreshRate()
+	if self.refreshHz == nil then
+		self.refreshHz = refresh.rate(self.display) or false
+	end
+	return self.refreshHz or nil
+end
 
 function X11Window:destroy()
 	if self.currentCursor then

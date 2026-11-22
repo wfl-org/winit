@@ -137,6 +137,10 @@ local function onAppCmd(_, command)
 	queueEvent({ command = command })
 end
 
+-- Whether the program takes the back key (and the back gesture, which Android reports as one) for
+-- itself: a program with pages of its own goes back through them, and leaves when it decides to.
+local backHandled = false
+
 ---@param input androidapi.ffi.InputEvent
 ---@return number
 local function onInput(_, input)
@@ -178,9 +182,10 @@ local function onInput(_, input)
 			repeatCount = lib.AKeyEvent_getRepeatCount(input),
 			deviceId = lib.AInputEvent_getDeviceId(input),
 		})
-		-- Back is reported and then left to the system, which finishes the activity; a program
-		-- hears about that as windowClose. Every other key is the program's.
-		return keyCode == KEYCODE_BACK and 0 or 1
+		-- Back is reported and then left to the system, which finishes the activity -- a program
+		-- hears about that as windowClose -- unless the program said it handles back itself (see
+		-- `setBackHandled`). Every other key is the program's.
+		return (keyCode ~= KEYCODE_BACK or backHandled) and 1 or 0
 	end
 
 	return 0
@@ -253,6 +258,21 @@ function AndroidWindow:setTextInput(enabled)
 	end
 end
 
+--- Whether back is the program's. Off, a back press finishes the activity, as Android does for an
+--- app with nothing to go back to; on, it arrives as a `keyPress` of "back" and nothing else
+--- happens, so the program goes back a page itself and leaves with `handler:exit()`.
+---@param handled boolean
+function AndroidWindow:setBackHandled(handled)
+	backHandled = handled
+end
+
+--- The display's fastest refresh rate, in hertz. Android runs it at that rate while the user is
+--- touching the window and for a moment after (see the loop), and chooses for itself otherwise.
+---@return number?
+function AndroidWindow:refreshRate()
+	return android.maxRefreshRate()
+end
+
 function AndroidWindow:destroy()
 	self.nativeWindow = nil
 	android.finish()
@@ -294,7 +314,11 @@ end
 ---@field mode winit.EventLoopMode
 ---@field timeout number?
 ---@field handler winit.EventManager
----@field mouseTouch number? # The touch pointer currently standing in for the mouse
+---@field gesture winit-android.Gesture? # The finger a mouse-only program hears, while it is down
+---@field fling { velocity: number, start: number, travelled: number, x: number, y: number, steppedAt: number? }? # A scroll still coasting after the finger left: how fast it was let go, when, how far it has gone since, and when it last moved
+---@field density number # Physical pixels per density-independent pixel, read when the loop starts
+---@field fast boolean? # Whether the display was last asked for its fastest rate
+---@field fastUntil number? # When it is given its own choice of rate back, on the monotonic clock
 ---@field buttons number # Mouse buttons held, as Android's button-state bits
 local AndroidEventLoop = {}
 AndroidEventLoop.__index = AndroidEventLoop
@@ -307,7 +331,9 @@ function AndroidEventLoop.new()
 		isActive = true,
 		mode = "poll",
 		timeout = nil,
-		mouseTouch = nil,
+		gesture = nil,
+		fling = nil,
+		density = 1,
 		buttons = 0,
 	}, AndroidEventLoop)
 
@@ -379,6 +405,8 @@ local function handleCommand(self, event, window, callback)
 	if command == appCommand.initWindow then
 		window.nativeWindow = app.window
 		window.visible = true
+		-- A rate asked for belongs to the surface it was asked on, and this one is new.
+		self.fast = nil
 		refreshSize(self, window)
 		window.shouldRedraw = true
 
@@ -394,8 +422,9 @@ local function handleCommand(self, event, window, callback)
 		deliver(self, { name = "map", window = window }, callback)
 		if window.textInput then android.showKeyboard(true) end
 	elseif command == appCommand.termWindow then
-		-- The surface is destroyed when this returns, so the program must let go of it now.
-		deliver(self, { name = "unmap", window = window }, callback)
+		-- The surface is destroyed when this returns, so the program must let go of it now; the
+		-- one the next initWindow brings is a new surface.
+		deliver(self, { name = "unmap", window = window, surfaceLost = true }, callback)
 		window.nativeWindow = nil
 		window.visible = false
 	elseif command == appCommand.windowResized or command == appCommand.configChanged
@@ -429,6 +458,54 @@ local function touchEvent(name, p, window)
 	return { name = name, window = window, id = p.id, x = p.x, y = p.y, pressure = p.pressure }
 end
 
+-- How far a finger travels before a touch is a drag rather than a tap, and how fast a released
+-- drag has to be moving to keep going, both in density-independent pixels.
+local TOUCH_SLOP_DP = 8
+local FLING_MIN_DP = 50 -- per second
+-- A fling slows two ways at once: by drag, which takes away a share of its speed -- this is the
+-- share left after a second -- and by a steady braking, which is what brings it to a stop rather
+-- than to a crawl that never ends. Its speed comes down to nought, smoothly, at the moment it stops.
+local FLING_FRICTION = 0.25
+local FLING_BRAKE_DP = 220 -- per second, per second
+-- How long the display is kept at its fastest rate after the last touch or fling.
+local FAST_HOLD = 2
+
+pcall(ffi.cdef, "int32_t AConfiguration_getDensity(void *config);")
+-- Under names of their own, so another module's declaration of the libc call cannot collide.
+ffi.cdef [[
+	struct winit_android_timespec { long tv_sec; long tv_nsec; };
+	int winit_android_clock_gettime(int clock, struct winit_android_timespec *ts) __asm__("clock_gettime");
+]]
+
+local CLOCK_MONOTONIC = 1
+local timespec = ffi.new("struct winit_android_timespec")
+
+---@return number seconds # On the monotonic clock
+local function now()
+	ffi.C.winit_android_clock_gettime(CLOCK_MONOTONIC, timespec)
+	return tonumber(timespec.tv_sec) + tonumber(timespec.tv_nsec) / 1e9
+end
+
+--- Physical pixels per density-independent pixel.
+---@return number
+local function densityScale()
+	local ok, dpi = pcall(function() return lib.AConfiguration_getDensity(app.config) end)
+	dpi = ok and tonumber(dpi) or 0
+	return dpi > 0 and dpi / 160 or 1
+end
+
+---@param self winit-android.EventLoop
+---@param window winit-android.Window
+---@param x number
+---@param y number
+---@param dy number # Pixels the content is pulled up by: positive scrolls down, as a wheel's dy does
+---@param callback winit.EventHandler
+local function scrollBy(self, window, x, y, dy, callback)
+	if dy ~= 0 then
+		deliver(self, { name = "mouseScroll", window = window, x = x, y = y, dx = 0, dy = dy, pixels = true }, callback)
+	end
+end
+
 ---@param self winit-android.EventLoop
 ---@param event table
 ---@param window winit-android.Window
@@ -436,30 +513,74 @@ end
 local function handleTouch(self, event, window, callback)
 	local action = event.action
 	local pointers = event.pointers
+	local gesture = self.gesture
 
 	if action == motionAction.down or action == motionAction.pointerDown then
 		local p = pointers[event.index + 1]
 		deliver(self, touchEvent("touchStart", p, window), callback)
-		-- The first finger down also drives the mouse, so a program that only knows the mouse
-		-- still works; later fingers are touches only.
-		if self.mouseTouch == nil then
-			self.mouseTouch = p.id
-			deliver(self, { name = "mouseMove", window = window, x = p.x, y = p.y }, callback)
-			deliver(self, { name = "mousePress", window = window, x = p.x, y = p.y, button = 1 }, callback)
+		-- The first finger is the one a mouse-only program hears, but not yet: whether it is a
+		-- tap, a scroll or a drag is only known once it has moved or been lifted. A finger put
+		-- down stops a list that is still coasting, as on every phone.
+		if gesture == nil then
+			self.fling = nil
+			self.gesture = {
+				id = p.id, startX = p.x, startY = p.y, x = p.x, y = p.y, mode = "pending",
+				samples = { { t = now(), y = p.y } },
+			}
 		end
 	elseif action == motionAction.move then
 		for _, p in ipairs(pointers) do
 			deliver(self, touchEvent("touchMove", p, window), callback)
-			if p.id == self.mouseTouch then
-				deliver(self, { name = "mouseMove", window = window, x = p.x, y = p.y }, callback)
+			if gesture ~= nil and p.id == gesture.id then
+				if gesture.mode == "pending" then
+					local slop = TOUCH_SLOP_DP * self.density
+					local dx, dy = p.x - gesture.startX, p.y - gesture.startY
+					if math.abs(dy) > slop and math.abs(dy) >= math.abs(dx) then
+						-- Up and down is a scroll of whatever is under the finger.
+						gesture.mode = "scroll"
+					elseif math.abs(dx) > slop then
+						-- Sideways is a drag, which is what a slider and a resize edge take: the
+						-- press goes where the finger went down.
+						gesture.mode = "drag"
+						deliver(self, { name = "mouseMove", window = window, x = gesture.startX, y = gesture.startY }, callback)
+						deliver(self, { name = "mousePress", window = window, x = gesture.startX, y = gesture.startY, button = 1 }, callback)
+					end
+				end
+
+				if gesture.mode == "scroll" then
+					scrollBy(self, window, p.x, p.y, gesture.y - p.y, callback)
+					local samples = gesture.samples
+					samples[#samples + 1] = { t = now(), y = p.y }
+					if #samples > 6 then table.remove(samples, 1) end
+					gesture.x, gesture.y = p.x, p.y
+				elseif gesture.mode == "drag" then
+					deliver(self, { name = "mouseMove", window = window, x = p.x, y = p.y }, callback)
+					gesture.x, gesture.y = p.x, p.y
+				end
 			end
 		end
 	elseif action == motionAction.up or action == motionAction.pointerUp then
 		local p = pointers[event.index + 1]
 		deliver(self, touchEvent("touchEnd", p, window), callback)
-		if p.id == self.mouseTouch then
-			self.mouseTouch = nil
-			deliver(self, { name = "mouseRelease", window = window, x = p.x, y = p.y, button = 1 }, callback)
+		if gesture ~= nil and p.id == gesture.id then
+			self.gesture = nil
+			if gesture.mode == "pending" then
+				-- Lifted near where it went down: a tap, which is a click where the finger was.
+				deliver(self, { name = "mouseMove", window = window, x = gesture.startX, y = gesture.startY }, callback)
+				deliver(self, { name = "mousePress", window = window, x = gesture.startX, y = gesture.startY, button = 1 }, callback)
+				deliver(self, { name = "mouseRelease", window = window, x = gesture.startX, y = gesture.startY, button = 1 }, callback)
+			elseif gesture.mode == "drag" then
+				deliver(self, { name = "mouseRelease", window = window, x = p.x, y = p.y, button = 1 }, callback)
+			else
+				-- A scroll let go of while moving keeps moving and slows down.
+				local samples = gesture.samples
+				local first, last = samples[1], samples[#samples]
+				local span = last.t - first.t
+				local velocity = span > 0 and (first.y - last.y) / span or 0
+				if math.abs(velocity) >= FLING_MIN_DP * self.density then
+					self.fling = { velocity = velocity, start = now(), travelled = 0, x = p.x, y = p.y }
+				end
+			end
 		end
 	elseif action == motionAction.cancel then
 		-- The system took the gesture (a swipe from the edge, a palm): every pointer is gone,
@@ -467,11 +588,45 @@ local function handleTouch(self, event, window, callback)
 		for _, p in ipairs(pointers) do
 			deliver(self, touchEvent("touchCancel", p, window), callback)
 		end
-		if self.mouseTouch ~= nil then
+		if gesture ~= nil and gesture.mode == "drag" then
 			local p = pointers[1]
-			self.mouseTouch = nil
 			deliver(self, { name = "mouseRelease", window = window, x = p.x, y = p.y, button = 1 }, callback)
 		end
+		self.gesture = nil
+	end
+end
+
+--- Where a fling has got to `t` seconds after it was let go, and whether it has stopped. Speed
+--- falls as dv/dt = -k*v - c: drag `k` and braking `c`. That has a closed form, so where it is at
+--- any moment is worked out from when it started, never summed step by step: a step that comes
+--- late moves it further, and no rounding builds up.
+---@param speed number # How fast it was let go, in pixels a second; always positive
+---@param brake number # The braking, in pixels a second a second
+---@param t number
+---@return number distance
+---@return boolean stopped
+local function flingAt(speed, brake, t)
+	local k = -math.log(FLING_FRICTION)
+	local glide = brake / k
+	local stopsAt = math.log(1 + speed / glide) / k
+	local stopped = t >= stopsAt
+	if stopped then t = stopsAt end
+	return (speed + glide) * (1 - math.exp(-k * t)) / k - glide * t, stopped
+end
+
+--- One step of a fling: the distance it has covered since the last step.
+---@param self winit-android.EventLoop
+---@param window winit-android.Window
+---@param callback winit.EventHandler
+local function stepFling(self, window, callback)
+	local fling = self.fling
+	if fling == nil then return end
+	local direction = fling.velocity < 0 and -1 or 1
+	local distance, stopped = flingAt(math.abs(fling.velocity), FLING_BRAKE_DP * self.density, now() - fling.start)
+	scrollBy(self, window, fling.x, fling.y, direction * (distance - fling.travelled), callback)
+	fling.travelled = distance
+	if stopped then
+		self.fling = nil
 	end
 end
 
@@ -554,6 +709,7 @@ end
 ---@param callback winit.EventHandler
 function AndroidEventLoop:run(callback)
 	self.isActive = true
+	self.density = densityScale()
 
 	while self.isActive do
 		local timeout = 0
@@ -562,6 +718,20 @@ function AndroidEventLoop:run(callback)
 		local window = firstWindow(self)
 		if self.mode == "wait" or (window ~= nil and window.nativeWindow == nil) then
 			timeout = self.timeout and math.floor(self.timeout * 1000) or -1
+		end
+		-- A coasting scroll is a step a frame: the loop does not wait while one is going, and the
+		-- frame each pass draws -- whose present waits for the display -- is what paces it. Nor does
+		-- it sleep past giving the display's rate back once the screen has been still long enough.
+		if self.fling ~= nil and window ~= nil and window.nativeWindow ~= nil then
+			-- A step whose frame came out the same is not presented, and nothing waits for the
+			-- display then: the next step is held to a frame's time after the last one, so a list
+			-- coasting against its end does not spin the loop.
+			local frame = 1 / (android.maxRefreshRate() or 60)
+			local left = (self.fling.steppedAt or 0) + frame - now()
+			timeout = left > 0 and math.ceil(left * 1000) or 0
+		elseif self.fast and self.fastUntil ~= nil then
+			local left = math.max(0, math.ceil((self.fastUntil - now()) * 1000))
+			if timeout < 0 or timeout > left then timeout = left end
 		end
 
 		android.pollOnce(timeout)
@@ -587,6 +757,36 @@ function AndroidEventLoop:run(callback)
 				end
 			elseif event.command == appCommand.destroy then
 				self.isActive = false
+			end
+		end
+
+		window = firstWindow(self)
+		if window ~= nil and window.nativeWindow ~= nil then
+			-- Exactly one step of a fling for each frame, taken just before it is drawn and drawn
+			-- whatever the program's own frame pacing says: a step taken with no frame after it is
+			-- motion that shows up a frame late, two steps in one frame -- a list that jerks.
+			-- A pass woken early -- by an event that came in between frames -- is not a frame of
+			-- the fling's own, and moves nothing.
+			local fling = self.fling
+			local frame = 1 / (android.maxRefreshRate() or 60)
+			if fling ~= nil and now() - (fling.steppedAt or 0) >= frame * 0.75 then
+				stepFling(self, window, callback)
+				if self.fling ~= nil then self.fling.steppedAt = now() end
+				window.shouldRedraw = true
+			end
+
+			-- A finger on the screen, or a list still coasting from one, is motion the eye follows:
+			-- the display is asked for its fastest rate then, and for a moment after, and given its
+			-- own choice back once nothing has moved for that long -- a still screen held at the
+			-- fastest rate is battery spent on nothing.
+			local at = now()
+			if self.gesture ~= nil or self.fling ~= nil then
+				self.fastUntil = at + FAST_HOLD
+			end
+			local fast = self.fastUntil ~= nil and at < self.fastUntil
+			if fast ~= self.fast then
+				self.fast = fast
+				android.setFrameRate(fast and (android.maxRefreshRate() or 0) or 0)
 			end
 		end
 

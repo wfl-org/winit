@@ -91,6 +91,7 @@ local backendApi = backend --[[@as winit.Backend]]
 ---@field captureMediaKeys (fun(self: winit.Window): string[])? # Takes the play, stop, next and previous keys whether or not the window has focus, where the backend can; returns the ones another program already holds
 ---@field releaseMediaKeys (fun(self: winit.Window))? # Gives back what captureMediaKeys took; destroying the window does too
 ---@field setTextInput (fun(self: winit.Window, enabled: boolean))? # Show or hide the on-screen keyboard, where the platform has one; what it types arrives as keyPress `text`
+---@field refreshRate (fun(self: winit.Window): number?)? # The display's refresh rate in hertz, where the backend can tell: the most frames a window is worth drawing a second
 local Window = backendApi.Window
 
 ---@param eventLoop winit.EventLoop
@@ -128,14 +129,14 @@ end
 --- | { window: winit.Window, name: "resize" }
 --- | { window: winit.Window, name: "map" }
 --- | { window: winit.Window, name: "create" }
---- | { window: winit.Window, name: "unmap" }
+--- | { window: winit.Window, name: "unmap", surfaceLost: boolean? } # surfaceLost: the platform destroys the window's surface; a GPU surface made for it must be let go of now and made again on the next map
 --- | { window: winit.Window, name: "minimize" }
 --- | { window: winit.Window, name: "restore" }
 --- | { window: winit.Window, name: "trayClick" }
 --- | { window: winit.Window, name: "trayMenu", id: string }
 --- | { window: winit.Window, name: "mouseMove", x: number, y: number }
 --- | { name: "mouseMotion", dx: number, dy: number }
---- | { window: winit.Window, name: "mouseScroll", dx: number, dy: number }
+--- | { window: winit.Window, name: "mouseScroll", dx: number, dy: number, x: number?, y: number?, pixels: boolean? } # pixels: a touch drag, in pixels at x, y; otherwise a wheel's turn where the pointer is
 --- | { window: winit.Window, name: "mousePress", x: number, y: number, button: number }
 --- | { window: winit.Window, name: "mouseRelease", x: number, y: number, button: number }
 --- | { window: winit.Window, name: "keyPress", key: winit.KeyName, modifiers: winit.KeyModifiers, text: string?, repeated: boolean? }
