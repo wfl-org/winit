@@ -90,6 +90,7 @@ local backendApi = backend --[[@as winit.Backend]]
 ---@field setIcon (fun(self: winit.Window, width: number, height: number, rgba: string))? # A square picture for the title bar, where the backend has one
 ---@field captureMediaKeys (fun(self: winit.Window): string[])? # Takes the play, stop, next and previous keys whether or not the window has focus, where the backend can; returns the ones another program already holds
 ---@field releaseMediaKeys (fun(self: winit.Window))? # Gives back what captureMediaKeys took; destroying the window does too
+---@field setTextInput (fun(self: winit.Window, enabled: boolean))? # Show or hide the on-screen keyboard, where the platform has one; what it types arrives as keyPress `text`
 local Window = backendApi.Window
 
 ---@param eventLoop winit.EventLoop
@@ -111,8 +112,15 @@ end
 --- | "f1" | "f2" | "f3" | "f4" | "f5" | "f6" | "f7" | "f8" | "f9" | "f10" | "f11" | "f12"
 --- | "left-shift" | "right-shift" | "left-ctrl" | "right-ctrl"
 --- | "left-alt" | "right-alt" | "left-super" | "right-super" | "caps-lock"
+--- | "back" # Android's back button or gesture; the system closes the app after it unless the program exits first
 --- | string
 
+--- Touch events: one finger, or a stylus tip, on a touch screen. `id` stays the same from its
+--- touchStart to its touchEnd or touchCancel, and is reused after; `pressure` is 0 to 1, 1 where
+--- the screen does not measure it. The first finger down also drives the mouse as button 1, so a
+--- program that handles only the mouse works on a touch screen; one that handles touches should
+--- ignore the mouse events of a touch screen. Gestures (pinch, pan, rotate) are not events: a
+--- program works them out from its touches.
 ---@alias winit.Event
 --- | { name: "aboutToWait" }
 --- | { window: winit.Window, name: "windowClose" }
@@ -136,6 +144,10 @@ end
 --- | { window: winit.Window, name: "focusOut" }
 --- | { window: winit.Window, name: "fileDrop", paths: string[], x: number, y: number }
 --- | { window: winit.Window, name: "mediaKey", action: winit.MediaAction }
+--- | { window: winit.Window, name: "touchStart", id: number, x: number, y: number, pressure: number }
+--- | { window: winit.Window, name: "touchMove", id: number, x: number, y: number, pressure: number }
+--- | { window: winit.Window, name: "touchEnd", id: number, x: number, y: number, pressure: number }
+--- | { window: winit.Window, name: "touchCancel", id: number, x: number, y: number, pressure: number } # The system took the touch (an edge swipe, a palm): forget it, it is not a release
 
 --- A window's clipboard: what a program copies to and pastes from. A platform hands its
 --- clipboard around as a whole, so what this is a handle on is the system's, not a window's --

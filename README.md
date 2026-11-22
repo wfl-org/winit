@@ -4,9 +4,9 @@ Window creation and handling library in pure LuaJIT.
 
 ## Support
 
-| Windows | Linux | macOS |
-| ------- | ----- | ----- |
-| ✅      | ✅    | ✅    |
+| Windows | Linux | macOS | Android |
+| ------- | ----- | ----- | ------- |
+| ✅      | ✅    | ✅    | ✅      |
 
 ## Installation
 
@@ -25,9 +25,10 @@ The backends are packages of their own, and a program installs the one its platf
 | `winit-x11`   | Linux    | Xlib and XInput2, through [x11api](https://github.com/bycruz/x11api) |
 | `winit-win32` | Windows  | user32 and shell32, through [winapi](https://github.com/bycruz/winapi) |
 | `winit-macos` | macOS    | Cocoa, through a small Objective-C shim built when the package is installed |
+| `winit-android` | Android | NativeActivity, through [androidapi](https://github.com/wfl-org/androidapi) |
 
-`linux`, `windows` and `macos` are features lde turns on by itself, so naming winit is enough to
-get the right one:
+`linux`, `windows`, `macos` and `android` are features lde turns on by itself, so naming winit is
+enough to get the right one:
 
 ```jsonc
 "dependencies": {
@@ -49,6 +50,30 @@ line tools a mac ships with, since what compiles it is the clang already there.
 
 A renderer is given the view a window draws in with `window:nativeView()`, which is what a
 graphics backend on this platform makes its context out of.
+
+### Android
+
+An Android app has one window, the activity's, and it is full screen. Its surface exists only
+while the app is in the foreground: it arrives with `map` and is gone after `unmap`, so a
+renderer makes its GPU surface on `map` (from `window.nativeWindow`) and drops it on `unmap`.
+Going to the background is also `minimize`, coming back `restore`.
+
+Touches are events of their own, one per finger, with an `id` that stays the same for as long as
+the finger is down:
+
+```lua
+{ window = window, name = "touchStart", id = 0, x = 120, y = 80, pressure = 1 }
+-- then touchMove, and touchEnd -- or touchCancel when the system takes the gesture
+```
+
+The first finger down also drives the mouse as button 1, so a program written for the mouse
+works as it is. Gestures such as pinch and pan are not events: a program works them out from its
+touches.
+
+`window:setTextInput(true)` shows the on-screen keyboard; what it types arrives as `keyPress`
+events carrying `text`, as a hardware keyboard's keys do. A NativeActivity has no text input
+connection, so a keyboard's suggestions, composed text and emoji do not reach it. The back button
+is a `keyPress` with key `"back"`, after which the system closes the app (`windowClose`).
 
 ## Windows
 
