@@ -13,6 +13,16 @@ local BACKENDS = {
 }
 
 local backendPackage = BACKENDS[ffi.os]
+
+-- Android LuaJIT reports `jit.os == "Linux"`, so the Android backend is chosen
+-- by the host binding rather than by ffi.os.
+do
+	local ok, android = pcall(require, "androidapi")
+	if ok and android.isAndroid then
+		backendPackage = "winit-android"
+	end
+end
+
 if not backendPackage then
 	error("Unsupported platform: " .. ffi.os)
 end

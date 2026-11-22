@@ -17,6 +17,10 @@
 		"winit-macos": {
 			"path": "../winit-macos",
 			"optional": true
+		},
+		"winit-android": {
+			"path": "../winit-android",
+			"optional": true
 		}
 	},
 	"features": {
@@ -28,6 +32,9 @@
 		],
 		"macos": [
 			"winit-macos"
+		],
+		"android": [
+			"winit-android"
 		]
 	},
 	"devDependencies": {

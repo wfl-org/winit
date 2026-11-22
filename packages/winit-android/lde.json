@@ -1,0 +1,11 @@
+{
+	"name": "winit-android",
+	"description": "The Android backend of winit",
+	"authors": ["David Cruz <david@bycruz.dev>"],
+	"version": "0.1.0",
+	"dependencies": {
+		"androidapi": {
+			"version": "^0.1.0"
+		}
+	}
+}
