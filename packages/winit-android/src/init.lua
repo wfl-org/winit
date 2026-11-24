@@ -652,7 +652,12 @@ local function handleTouch(self, event, window, callback)
 				end
 
 				if gesture.mode == "scroll" then
-					scrollBy(self, window, p.x, p.y, gesture.y - p.y, callback)
+					-- A scroll belongs to what was under the finger when it went down, not to
+					-- whatever it has moved over since: a finger dragging the content up moves down
+					-- the screen, toward the bottom bar, and a scroll handed to the box it ended over
+					-- is one the list never hears -- it stops dead halfway through the drag. Android
+					-- fixes the target the same way, at the start of the gesture.
+					scrollBy(self, window, gesture.startX, gesture.startY, gesture.y - p.y, callback)
 					local samples = gesture.samples
 					samples[#samples + 1] = { t = now(), y = p.y }
 					if #samples > 6 then table.remove(samples, 1) end
@@ -676,13 +681,16 @@ local function handleTouch(self, event, window, callback)
 			elseif gesture.mode == "drag" then
 				deliver(self, { name = "mouseRelease", window = window, x = p.x, y = p.y, button = 1 }, callback)
 			else
-				-- A scroll let go of while moving keeps moving and slows down.
+				-- A scroll let go of while moving keeps moving and slows down. It coasts where the
+				-- gesture began, like the drag before it: a finger dragging the content up lifts
+				-- over the bars at the bottom, and a fling sent from there is a fling nothing
+				-- scrolls.
 				local samples = gesture.samples
 				local first, last = samples[1], samples[#samples]
 				local span = last.t - first.t
 				local velocity = span > 0 and (first.y - last.y) / span or 0
 				if math.abs(velocity) >= FLING_MIN_DP * self.density then
-					self.fling = { velocity = velocity, start = now(), travelled = 0, x = p.x, y = p.y }
+					self.fling = { velocity = velocity, start = now(), travelled = 0, x = gesture.startX, y = gesture.startY }
 				end
 			end
 		end
