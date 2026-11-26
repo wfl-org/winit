@@ -453,6 +453,9 @@ local function handleCommand(self, event, window, callback)
 		deliver(self, { name = "unmap", window = window, surfaceLost = true }, callback)
 		window.nativeWindow = nil
 		window.visible = false
+		-- A rate asked for belonged to the surface that is going: the one that comes next is
+		-- not held at the fastest rate for what a touch on the old one asked for.
+		self.fastUntil = nil
 	elseif command == appCommand.windowResized or command == appCommand.configChanged
 		or command == appCommand.contentRectChanged then
 		local width, height = window.width, window.height
@@ -473,9 +476,22 @@ local function handleCommand(self, event, window, callback)
 	elseif command == appCommand.lostFocus then
 		deliver(self, { name = "focusOut", window = window }, callback)
 	elseif command == appCommand.pause then
+		-- A paused activity can still be on screen -- split-screen, a picture-in-picture window --
+		-- so it is not hidden here; `stop` is the system saying the user no longer sees it.
 		deliver(self, { name = "minimize", window = window }, callback)
-	elseif command == appCommand.resume then
-		deliver(self, { name = "restore", window = window }, callback)
+	elseif command == appCommand.stop then
+		window.visible = false
+	elseif command == appCommand.start or command == appCommand.resume then
+		-- Back in front of the user: with the surface it kept if the system did not take it away,
+		-- and one to come from `initWindow` otherwise. A window that was not drawn while it was
+		-- hidden owes the frame that shows it again.
+		window.visible = window.nativeWindow ~= nil
+		if window.visible then
+			window.shouldRedraw = true
+		end
+		if command == appCommand.resume then
+			deliver(self, { name = "restore", window = window }, callback)
+		end
 	elseif command == appCommand.destroy then
 		deliver(self, { name = "windowClose", window = window }, callback)
 		self.isActive = false
@@ -846,18 +862,40 @@ local function handleKey(self, event, window, callback)
 	end
 end
 
+-- ALooper's wait is a signed 32-bit count of milliseconds. A program asking to sleep longer
+-- than that is clamped rather than wrapped round to a negative timeout, which would be a wait
+-- with no end to it.
+local MAX_WAIT_MS = 0x7fffffff
+
 ---@param callback winit.EventHandler
 function AndroidEventLoop:run(callback)
 	self.isActive = true
 	self.density = densityScale()
 
+	-- One table each, reused by every pass: a handler reads an event and does not keep it.
+	local redrawEvent = { name = "redraw" }
+	local aboutToWaitEvent = { name = "aboutToWait" }
+
 	while self.isActive do
+		-- A deadline is what the program asked of the one wait that follows it, and it is taken
+		-- here and cleared: a program that stops asking gets a wait with no end to it again,
+		-- rather than waking for a deadline nobody wants any more. See `winit.EventManager`.
+		local deadline = self.timeout
+		self.timeout = nil
 		local timeout = 0
 		-- Nothing to draw into while the surface is gone: sleep until the system brings it back,
 		-- rather than spinning a program that asked for redraws.
 		local window = firstWindow(self)
 		if self.mode == "wait" or (window ~= nil and window.nativeWindow == nil) then
-			timeout = self.timeout and math.floor(self.timeout * 1000) or -1
+			if deadline ~= nil then
+				-- Rounded up so a wait never comes back before its deadline and asks again for
+				-- the fraction of a millisecond that was left, which is a wakeup for nothing.
+				timeout = math.max(0, math.ceil(deadline * 1000))
+				if timeout > MAX_WAIT_MS then timeout = MAX_WAIT_MS end
+			else
+				-- No end to it: woken by the next event, which is what an idle window is.
+				timeout = -1
+			end
 		end
 		-- A coasting scroll is a step a frame: the loop does not wait while one is going, and the
 		-- frame each pass draws -- whose present waits for the display -- is what paces it. Nor does
@@ -870,7 +908,10 @@ function AndroidEventLoop:run(callback)
 			-- one frame every 11 ms.
 			local frame = 1 / (currentRate() or 60)
 			local left = (self.fling.steppedAt or 0) + frame - now()
-			timeout = left > 0 and math.ceil(left * 1000) or 0
+			local held = left > 0 and math.ceil(left * 1000) or 0
+			-- A deadline the program asked for that falls inside the frame is taken as it is: a
+			-- step that is not due yet is one the pass after it takes.
+			if timeout <= 0 or timeout > held then timeout = held end
 		elseif self.fast and self.fastUntil ~= nil then
 			local left = math.max(0, math.ceil((self.fastUntil - now()) * 1000))
 			if timeout < 0 or timeout > left then timeout = left end
@@ -881,10 +922,14 @@ function AndroidEventLoop:run(callback)
 			if timeout < 0 or timeout > left then timeout = left end
 		end
 
-		android.pollOnce(timeout)
 		-- Drain whatever else is ready without waiting again, so a burst of input is handled in
-		-- one pass rather than one event per frame.
-		while android.pollOnce(0) >= 0 do end
+		-- one pass rather than one event per frame. Only a wait that ran out is known to have
+		-- nothing ready, so only that one skips the second look: an idle loop costs one call a
+		-- wakeup rather than two, and what a woken one left queued is still taken here.
+		local result = android.pollOnce(timeout)
+		if result ~= android.POLL_TIMEOUT and result ~= android.POLL_ERROR then
+			while android.pollOnce(0) >= 0 do end
+		end
 
 		for event in nextEvent do
 			window = firstWindow(self)
@@ -943,14 +988,19 @@ function AndroidEventLoop:run(callback)
 			end
 		end
 
+		-- The same two tables every pass: a frame of a window that is playing would otherwise
+		-- make a table for the redraw and another for going about waiting, at the rate of the
+		-- display, for nothing. Handlers read them and do not keep them.
 		for _, w in pairs(self.windows) do
 			if w.shouldRedraw and w.nativeWindow ~= nil then
 				w.shouldRedraw = false
-				deliver(self, { name = "redraw", window = w }, callback)
+				redrawEvent.window = w
+				callback(redrawEvent, self.handler)
 			end
 		end
 
-		deliver(self, { name = "aboutToWait" }, callback)
+		aboutToWaitEvent.window = firstWindow(self)
+		callback(aboutToWaitEvent, self.handler)
 	end
 end
 

@@ -7,11 +7,38 @@ local Dnd = require("winit-x11.dnd")
 local FileDialog = require("winit-x11.dialog")
 local refresh = require("winit-x11.refresh")
 
+-- A property change is a property the window manager writes -- the state a window is in is
+-- one -- and it is the only way an iconified window that stays mapped says so. The
+-- bindings do not name its event, so the layout Xlib uses for it is laid out here: the
+-- atom that changed and the state it was left in, after the fields every event starts with.
+ffi.cdef [[
+	struct winit_x11_property_event {
+		int type;
+		unsigned long serial;
+		int send_event;
+		void *display;
+		unsigned long window;
+		unsigned long atom;
+		unsigned long time;
+		int state;
+	};
+]]
+
+local PROPERTY_NOTIFY = 28
+--- PropertyChangeMask, which is not among the masks `x11api` names: a property change on
+--- a window selected with it arrives as a PropertyNotify.
+local PROPERTY_CHANGE_MASK = 0x00400000
+--- WM_STATE's IconicState: ICCCM's name for a minimized window.
+local ICONIC_STATE = 3
+
 ---@class winit-x11.Window
 ---@field id number
 ---@field width number
 ---@field height number
 ---@field shouldRedraw boolean
+---@field visible boolean? # On the screen: false while it is unmapped or the window manager has iconified it
+---@field mapped boolean? # Mapped by the server, which a window manager may hide while keeping it mapped
+---@field rawMotion boolean? # Raw motion is selected for this window's pointer grab
 ---@field frameAsked boolean?
 ---@field display XDisplay
 ---@field currentCursor number?
@@ -93,7 +120,10 @@ function X11Window.new(eventLoop, width, height)
 			x11.EventMaskBits.PointerMotion,
 			x11.EventMaskBits.KeyPress,
 			x11.EventMaskBits.KeyRelease,
-			x11.EventMaskBits.FocusChange
+			x11.EventMaskBits.FocusChange,
+			-- The window manager says a window is minimized -- which can happen without it
+			-- ever being unmapped -- by changing a property, and only a property change says so.
+			PROPERTY_CHANGE_MASK
 		)
 	)
 	-- A window is a place files may be dropped on, which is said by a property the program doing
@@ -182,6 +212,37 @@ local cursors = {
 	sizens = x11.Icon.SbVDoubleArrow,
 }
 
+--- Raw motion is relative movement, which is what a grabbed pointer is used for: a game
+--- that holds the pointer still gets movement to turn with. It is selected while a grab is
+--- held and let go of when it ends, because selected on the root window it is every mouse
+--- movement anywhere on the screen -- a wakeup for a window with nothing to do with it.
+---@param display XDisplay
+---@param selected boolean
+local function selectRawMotion(display, selected)
+	local root = x11.defaultRootWindow(display)
+	-- An empty mask is how a selection is taken back: XISelectEvents replaces what this
+	-- client had selected for the device and window.
+	xi2.selectEvents(display, root, xi2.Device.All,
+		selected and { xi2.EventType.RawMotion } or {})
+	x11.flush(display)
+end
+
+--- Says whether a window is on the screen, and asks for a frame when it comes back: what
+--- the app drew while it was away is stale, and a window restored without a frame would
+--- stay blank until something else asked for one.
+---@param window winit-x11.Window
+---@param visible boolean
+local function setVisible(window, visible)
+	if window.visible == visible then
+		return
+	end
+
+	window.visible = visible
+	if visible then
+		window.shouldRedraw = true
+	end
+end
+
 ---@return number?
 function X11Window:getOrCreateBlankCursor()
 	if not self.blankCursor then
@@ -203,6 +264,19 @@ function X11Window:setCursorGrab(mode)
 	end
 
 	local previous = self.cursorGrab
+
+	-- Only a grab needs relative movement; the rest of the time the window's own
+	-- MotionNotify is what a pointer over it says.
+	if mode == "contain" or mode == "locked" then
+		if not self.rawMotion then
+			selectRawMotion(self.display, true)
+			self.rawMotion = true
+		end
+	elseif previous == "contain" or previous == "locked" then
+		selectRawMotion(self.display, false)
+		self.rawMotion = false
+	end
+
 	local eventMask = bit.bor(
 		x11.EventMaskBits.PointerMotion,
 		x11.EventMaskBits.ButtonPress,
@@ -252,6 +326,37 @@ function X11Window:resetCursor()
 	x11.undefineCursor(self.display, self.id)
 end
 
+--- Takes the window off the screen and off the taskbar; its loop and keys keep working.
+---@return nil
+function X11Window:hide()
+	x11.unmapWindow(self.display, self.id)
+	x11.flush(self.display)
+	return nil
+end
+
+--- Brings a hidden or minimized window back, in front and with the keyboard.
+---@return nil
+function X11Window:show()
+	x11.mapWindow(self.display, self.id)
+	x11.raiseWindow(self.display, self.id)
+
+	-- A window the window manager has iconified but left mapped is not brought back by
+	-- mapping it again -- the server has it mapped already. The manager is asked to
+	-- activate it, which is what takes it out of the iconic state and gives it the keyboard.
+	local event = x11.Event()
+	event.type = x11.EventType.ClientMessage
+	event.xclient.window = self.id
+	event.xclient.message_type = x11.internAtom(self.display, "_NET_ACTIVE_WINDOW", 0)
+	event.xclient.format = 32
+	event.xclient.data.l[0] = 2 -- source: a program's own request, not a click on the window
+	event.xclient.data.l[1] = x11.CurrentTime
+	event.xclient.data.l[2] = 0
+	x11.sendEvent(self.display, x11.defaultRootWindow(self.display), 0,
+		bit.bor(0x00100000, 0x00080000), event) -- SubstructureRedirectMask | SubstructureNotifyMask
+	x11.flush(self.display)
+	return nil
+end
+
 ---@param title string
 function X11Window:setTitle(title)
 	x11.changeProperty(self.display, self.id, "_NET_WM_NAME", "UTF8_STRING", 8, 0,
@@ -294,6 +399,10 @@ function X11Window:refreshRate()
 end
 
 function X11Window:destroy()
+	if self.rawMotion then
+		selectRawMotion(self.display, false)
+	end
+
 	if self.currentCursor then
 		x11.freeCursor(self.display, assert(self.currentCursor))
 	end
@@ -328,8 +437,11 @@ function X11Window:acknowledgeSync()
 end
 
 ---@class winit-x11.EventLoop
----@field windows table<string, winit-x11.Window>
+---@field windows table<number, winit-x11.Window>
 ---@field display XDisplay
+---@field netWmState number # The atom of the EWMH list of what the window manager has done to a window
+---@field netWmStateHidden number # The atom naming the hidden (minimized) state in that list
+---@field wmState number # The atom of the ICCCM state an older window manager keeps
 ---@field clipboard winit-x11.Clipboard? # The one clipboard made on this loop, whose requests it answers
 ---@field dnd winit-x11.Dnd # The drag protocol a drop on a window of this loop is read with
 ---@field stashedEvents XEvent[] # Events kept back while something was waiting on another program
@@ -347,6 +459,11 @@ function X11EventLoop.new()
 		windows = {},
 		clipboard = nil,
 		stashedEvents = {},
+		-- Interned once: a property notification names the property that changed, and a
+		-- window manager writing either state is what says a window is hidden or back.
+		netWmState = tonumber(x11.internAtom(display, "_NET_WM_STATE", 0)),
+		netWmStateHidden = tonumber(x11.internAtom(display, "_NET_WM_STATE_HIDDEN", 0)),
+		wmState = tonumber(x11.internAtom(display, "WM_STATE", 0)),
 	}, X11EventLoop)
 
 	self.dnd = Dnd.new(self)
@@ -356,13 +473,13 @@ end
 
 ---@param window winit-x11.Window
 function X11EventLoop:register(window)
-	self.windows[tostring(window.id)] = window
+	self.windows[tonumber(window.id)] = window
 end
 
 ---@param window winit.Window
 function X11EventLoop:close(window)
 	window:destroy()
-	self.windows[tostring(window.id)] = nil
+	self.windows[tonumber(window.id)] = nil
 end
 
 ---@param callback winit.EventHandler
@@ -373,9 +490,9 @@ function X11EventLoop:run(callback)
 
 	local wmDeleteWindow = x11.internAtom(display, "WM_DELETE_WINDOW", 0)
 	local netWmSyncRequest = x11.internAtom(display, "_NET_WM_SYNC_REQUEST", 0)
-
-	local root = x11.defaultRootWindow(display)
-	xi2.selectEvents(display, root, xi2.Device.All, { xi2.EventType.RawMotion })
+	local netWmStateAtom = self.netWmState
+	local netWmStateHiddenAtom = self.netWmStateHidden
+	local wmStateAtom = self.wmState
 
 	local isActive = true
 	local currentMode = "poll"
@@ -383,6 +500,37 @@ function X11EventLoop:run(callback)
 
 	---@type table<number, winit.KeyName>
 	local held = {}
+
+	--- Whether the window manager says this window is minimized. There are two ways it can:
+	--- EWMH lists `_NET_WM_STATE_HIDDEN` among the window's states, and the older ICCCM
+	--- `WM_STATE` is IconicState. A manager that only unmaps the window never needs either.
+	---@param window winit-x11.Window
+	---@return boolean hidden
+	local function isHiddenByManager(window)
+		local states = x11.getAtomProperty(display, window.id, netWmStateAtom)
+		if states then
+			for i = 1, #states do
+				if states[i] == netWmStateHiddenAtom then
+					return true
+				end
+			end
+		end
+
+		local wmState = x11.getAtomProperty(display, window.id, wmStateAtom)
+
+		return wmState ~= nil and wmState[1] == ICONIC_STATE
+	end
+
+	--- Re-reads what the manager says about a window that is mapped, where a minimized window
+	--- that is still mapped is known by its properties rather than by an unmap.
+	---@param window winit-x11.Window
+	local function refreshVisible(window)
+		if not window.mapped then
+			return
+		end
+
+		setVisible(window, not isHiddenByManager(window))
+	end
 
 	---@type winit.EventManager
 	local handler = {}
@@ -536,11 +684,36 @@ function X11EventLoop:run(callback)
 		end,
 
 		[x11.EventType.MapNotify] = function(window)
+			if window then
+				---@cast window winit-x11.Window
+				window.mapped = true
+				-- The window manager may have put the window on screen in the state it was
+				-- iconified in, which it says with a property rather than with the map.
+				setVisible(window, true)
+				refreshVisible(window)
+			end
 			callback({ window = window, name = "map" }, handler)
 		end,
 
 		[x11.EventType.UnmapNotify] = function(window)
+			if window then
+				---@cast window winit-x11.Window
+				window.mapped = false
+				setVisible(window, false)
+			end
 			callback({ window = window, name = "unmap" }, handler)
+		end,
+
+		-- A window manager can iconify a window and leave it mapped, in which case no unmap
+		-- says so: what says it is one of the window's state properties being written.
+		[PROPERTY_NOTIFY] = function(window)
+			if not window then return end
+			---@cast window winit-x11.Window
+
+			local property = tonumber(ffi.cast("struct winit_x11_property_event *", event).atom)
+			if property == netWmStateAtom or property == wmStateAtom then
+				refreshVisible(window)
+			end
 		end,
 
 		[x11.EventType.CreateNotify] = function(window)
@@ -658,8 +831,7 @@ function X11EventLoop:run(callback)
 	}
 
 	local function processEvent()
-		local windowIdHash = tostring(event.xany.window)
-		local window = self.windows[windowIdHash]
+		local window = self.windows[tonumber(event.xany.window)]
 
 		local evtTypeHandler = Handlers[event.type]
 		if not evtTypeHandler then
@@ -699,7 +871,7 @@ function X11EventLoop:run(callback)
 
 	while isActive do
 		if currentMode == "poll" then
-			while nextEvent(false, false) do
+			while nextEvent(false, true) do
 				processEvent()
 			end
 		elseif timeout then
@@ -730,7 +902,10 @@ function X11EventLoop:run(callback)
 		end
 
 		for _, window in pairs(self.windows) do
-			if window.shouldRedraw then
+			-- A window that is not on screen is not drawn: a frame into a surface the
+			-- compositor has taken away is one the render path waits on and never comes
+			-- back from. What was asked for stays asked, and is drawn once it is back.
+			if window.shouldRedraw and window.visible ~= false then
 				window.shouldRedraw = false
 				redrawEvent.window = window
 				callback(redrawEvent, handler)

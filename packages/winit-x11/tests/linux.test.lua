@@ -399,3 +399,83 @@ test.it("should set and reset cursor without errors", function()
 
 	teardown(eventLoop, window)
 end)
+
+--- Runs the loop in poll mode until `done` sees what it is waiting for, or five seconds pass: a
+--- window manager answers a map or an unmap on its own time, so it is waited for.
+---@param eventLoop winit-x11.EventLoop
+---@param done fun(event: winit.Event): boolean
+---@return boolean seen
+local function pumpUntil(eventLoop, done)
+	local seen = false
+	local deadline = os.clock() + 5
+
+	while not seen and os.clock() < deadline do
+		local frames = 0
+
+		eventLoop:run(function(event, handler)
+			---@cast event winit.Event
+			---@cast handler winit.EventManager
+			handler:setMode("poll")
+			frames = frames + 1
+
+			if done(event) then
+				seen = true
+			end
+
+			if seen or frames > 200 then
+				handler:exit()
+			end
+		end)
+	end
+
+	return seen
+end
+
+test.it("should say whether the window is on screen and bring it back", function()
+	local eventLoop, window = setup()
+	local display = displayOf(eventLoop)
+
+	test.equal(eventLoop.windows[tonumber(window.id)], window, "it is found by its numeric id")
+
+	test.equal(pumpUntil(eventLoop, function() return window.visible == true end), true,
+		"a mapped window is visible")
+	test.equal(window.visible, true, "and says so")
+
+	window:hide()
+	x11.flush(display)
+
+	test.equal(pumpUntil(eventLoop, function() return window.visible == false end), true,
+		"an unmapped window is not visible")
+	test.equal(window.visible, false, "and says so")
+	test.equal(window.mapped, false, "the server has it unmapped")
+
+	window:show()
+	x11.flush(display)
+
+	test.equal(pumpUntil(eventLoop, function() return window.visible == true end), true,
+		"a window brought back is visible again")
+	test.equal(window.visible, true, "and asks for the frame that was skipped while it was away")
+
+	-- A window manager that iconifies without unmapping says so with the window's states,
+	-- which is the only signal an app gets for a window that stays mapped. The pause lets the
+	-- manager's own reaction to the activation above land first: it writes the state too, and
+	-- a write of its own arriving after this one would be the state it says the window is in.
+	os.execute("sleep 0.15")
+
+	x11.setAtomProperty(display, window.id, eventLoop.netWmState, x11.XA.ATOM,
+		{ eventLoop.netWmStateHidden })
+	x11.flush(display)
+
+	test.equal(pumpUntil(eventLoop, function() return window.visible == false end), true,
+		"a window the manager has hidden is not visible")
+	test.equal(window.visible, false)
+
+	x11.deleteProperty(display, window.id, eventLoop.netWmState)
+	x11.flush(display)
+
+	test.equal(pumpUntil(eventLoop, function() return window.visible == true end), true,
+		"and it is visible again once the manager lets it out")
+	test.equal(window.visible, true)
+
+	teardown(eventLoop, window)
+end)
