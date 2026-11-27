@@ -1,8 +1,11 @@
--- The desktop's file and folder picker on X11. There is no one file dialog in the X11 protocol: a
--- desktop provides one as a program of its own, and XDG_CURRENT_DESKTOP is the standard name for
--- which desktop is running. KDE's chooser is kdialog; the GTK desktops' is zenity; yad is the
--- fallback for a desktop that has neither. They are spawned directly -- no shell, no quoting.
+-- The desktop's file and folder picker on X11. There is no one file dialog in the X11 protocol.
+-- The xdg-desktop-portal FileChooser is asked first: every current desktop ships one (GNOME, KDE,
+-- LXQt, wlroots desktops) and it needs no extra program. Without a portal, a desktop provides a
+-- chooser as a program of its own, and XDG_CURRENT_DESKTOP is the standard name for which desktop
+-- is running. KDE's chooser is kdialog; the GTK desktops' is zenity; yad is the fallback for a
+-- desktop that has neither. They are spawned directly -- no shell, no quoting.
 local process = require("process")
+local portal = require("winit-x11.portal")
 
 local FileDialog = {}
 
@@ -116,6 +119,9 @@ function FileDialog.open(_window, opts)
 	local home = os.getenv("HOME") or "."
 	local multiple = opts.multiple == true
 	local filters = opts.filters
+
+	local chosen = portal.open(_window, opts, title)
+	if chosen ~= nil then return chosen end
 
 	local choices = prefersKde() and { "kdialog", "zenity", "yad" }
 		or { "zenity", "kdialog", "yad" }

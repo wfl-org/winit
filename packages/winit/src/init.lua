@@ -120,8 +120,9 @@ end
 --- touchStart to its touchEnd or touchCancel, and is reused after; `pressure` is 0 to 1, 1 where
 --- the screen does not measure it. The first finger down also drives the mouse as button 1, so a
 --- program that handles only the mouse works on a touch screen; one that handles touches should
---- ignore the mouse events of a touch screen. Gestures (pinch, pan, rotate) are not events: a
---- program works them out from its touches.
+--- ignore the mouse events of a touch screen. The mouse events a finger drives say so with
+--- `touch`, which is how a program that hears both tells a finger from the mouse beside it.
+--- Gestures (pinch, pan, rotate) are not events: a program works them out from its touches.
 ---@alias winit.Event
 --- | { name: "aboutToWait" }
 --- | { window: winit.Window, name: "windowClose" }
@@ -134,12 +135,12 @@ end
 --- | { window: winit.Window, name: "restore" }
 --- | { window: winit.Window, name: "trayClick" }
 --- | { window: winit.Window, name: "trayMenu", id: string }
---- | { window: winit.Window, name: "mouseMove", x: number, y: number }
+--- | { window: winit.Window, name: "mouseMove", x: number, y: number, touch: boolean? } # touch: the first finger of a touch screen drove the pointer here
 --- | { window: winit.Window, name: "mouseLeave" } # The pointer is no longer over the window, so nothing is under it until it moves again
 --- | { name: "mouseMotion", dx: number, dy: number }
 --- | { window: winit.Window, name: "mouseScroll", dx: number, dy: number, x: number?, y: number?, pixels: boolean? } # pixels: a touch drag, in pixels at x, y; otherwise a wheel's turn where the pointer is
---- | { window: winit.Window, name: "mousePress", x: number, y: number, button: number }
---- | { window: winit.Window, name: "mouseRelease", x: number, y: number, button: number }
+--- | { window: winit.Window, name: "mousePress", x: number, y: number, button: number, touch: boolean? } # touch: a finger pressed, since the screen reads it as button 1
+--- | { window: winit.Window, name: "mouseRelease", x: number, y: number, button: number, touch: boolean? }
 --- | { window: winit.Window, name: "keyPress", key: winit.KeyName, modifiers: winit.KeyModifiers, text: string?, repeated: boolean? }
 --- | { window: winit.Window, name: "keyRelease", key: winit.KeyName, modifiers: winit.KeyModifiers, repeated: boolean? }
 --- | { window: winit.Window, name: "focusIn" }
